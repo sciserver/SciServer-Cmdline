@@ -31,3 +31,7 @@ The authentication token will be stored in the `SS_TOKEN` environment variable f
 ```bash
 ./sciserver --help
 ```
+
+# Acknowledgments
+
+The code is based on https://github.com/sciserver/SciScript-Python by mtaghiza et al. but has no dependecies other than `requests` and the standard Python 3 library. It does not provide a Python API, just command-line access to SciServer services.
