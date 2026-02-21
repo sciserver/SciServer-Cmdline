@@ -1,0 +1,682 @@
+#!/bin/env python3
+
+# SciServer command-line tool
+# ---------------------------
+# This tool provides a command-line interface for interacting with SciServer services,
+# including authentication and file management through the SciServer File Service.
+# 
+# Usage:
+#   sciserver login [--username USERNAME] [--password PASSWORD] [-s]
+#   sciserver ls [PATH]
+#   sciserver mkdir PATH
+#   sciserver rm PATH
+#   sciserver cp SOURCE DESTINATION
+#   sciserver mv SOURCE DESTINATION
+#   sciserver cat PATH
+#
+# SciServer requires an authentication token for most operations. Create one using the
+# login command and set it in your environment with
+#
+#   eval $(sciserver login -s)
+#
+# TODO:
+# - Add progress bars for file uploads and downloads
+# - Implement 'mv' command
+# - Implement recursive directory copy
+# - Raise error on directory remove without recursive flag
+
+import os, sys
+import argparse
+import getpass
+import json
+import requests
+from datetime import datetime
+from dateutil import parser as dateparser
+from collections import namedtuple
+
+# Sentinel for missing function arguments
+MISSING = object()
+
+# Default URLs for SciServer services
+SS_SERVER = 'https://apps.sciserver.org'
+SS_AUTH_URL = f'{SS_SERVER}/login-portal/keystone/v3/tokens'
+SS_RACM_API_URL = f"{SS_SERVER}/racm"
+SS_FILE_SERVICE_URL = f'{SS_SERVER}/fileservice'
+
+class HttpError(Exception):
+    def __init__(self, status_code, message):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(f"HTTP {status_code}: {message}")
+
+def http(method, uri, headers=MISSING, data=MISSING):
+    auth_token = get_auth_token(ignore_missing=True)
+    
+    headers = headers if headers is not MISSING else {}
+    headers["Content-Type"] = "application/json"
+    
+    if auth_token:
+        headers["X-Auth-Token"] = auth_token
+    
+    json_data = json.dumps(data).encode() if data is not MISSING else None
+
+    response = requests.request(method, uri, data=json_data, headers=headers)
+    
+    return handle_http_response(response)
+
+def handle_http_response(response, read_content=True):
+    if read_content and len(response.content) > 0:
+        content = response.json()
+    else:
+        content = None
+
+    # print(response.status_code)
+    # print(content)
+
+    if response.status_code != 200:
+        if content is not None and isinstance(content, dict) and "error" in content:
+            error = content.get("error", {})
+            if isinstance(error, dict):
+                error_message = error.get("message", "Unknown error")
+            else:
+                error_message = str(error)
+        else:
+            error_message = response.reason
+        raise HttpError(response.status_code, error_message)
+
+    return response, content
+
+def get_auth_token(ignore_missing=False):
+    token = os.environ.get('SS_TOKEN')
+    if not token and not ignore_missing:
+        raise HttpError(401, "Authentication token not found. Please run 'sciserver login' to obtain a token.")
+    return token
+
+def auth(username=MISSING, password=MISSING):
+    """
+    Authenticates the user with the SciServer Authentication service,
+    and returns an authentication token.
+    """
+
+    username = os.environ.get('SS_USERNAME', username)
+    password = os.environ.get('SS_PASSWORD', password)
+
+    if password is MISSING:
+        password = getpass.getpass(prompt='SciServer Password: ')
+
+    url = f'{SS_AUTH_URL}?TaskName=SciScript-Python.Authentication.Login'
+    data = { "auth": { "identity": { "password": { "user": { "name": username, "password": password } } } } }
+    response, content = http("POST", url, data=data)
+    token = response.headers['X-Subject-Token']
+    
+    return token
+
+FileInfo = namedtuple(
+    'FileInfo',
+    [
+        'path', 'name',
+        'owner', 'group',
+        'directory', 'size', 'date', 'read', 'write', 'execute'
+    ])
+
+FileServicePathInfo = namedtuple(
+    'FileServicePathInfo',
+    [
+        'data_volume',
+        'root_volume',
+        'user_volume_owner',
+        'user_volume',
+        'relative_path'
+    ])
+
+def get_file_services():
+    url = f'{SS_RACM_API_URL}/storem/fileservices?TaskName=SciScript-Python.Files.getFileServices'
+    response, content = http("GET", url)
+    return content
+
+__file_service_volumes_cache = {}
+
+def get_file_service_volumes(service_url=SS_FILE_SERVICE_URL):
+    if service_url in __file_service_volumes_cache:
+        return __file_service_volumes_cache[service_url]
+    else:
+        url = f'{service_url}/api/volumes/?TaskName=SciScript-Python.Files.getFileServices'
+        response, volumes = http("GET", url)
+        __file_service_volumes_cache[service_url] = volumes
+        return volumes
+
+def get_file_service_directory_listing(path_info):
+    if path_info.data_volume is not None:
+        url = f'{SS_FILE_SERVICE_URL}/api/jsontree/{path_info.data_volume}/{path_info.relative_path}' \
+              f'?level=2&TaskName=SciScript-Python.Files.dirList'
+    elif path_info.root_volume is not None and path_info.user_volume_owner is not None and path_info.user_volume is not None:
+        url = f'{SS_FILE_SERVICE_URL}/api/jsontree/{path_info.root_volume}/{path_info.user_volume_owner}/{path_info.user_volume}/{path_info.relative_path}' \
+              f'?level=2&TaskName=SciScript-Python.Files.dirList'
+    else:
+        raise ValueError("Invalid path info. Must specify either data volume or root volume with user volume owner and user volume.")
+    
+    response, folder = http("GET", url)
+    return folder
+
+def make_file_service_directory(path_info):
+    path = join_file_service_path(path_info, '')
+    url = f'{SS_FILE_SERVICE_URL}/api/folder/{path}' \
+          f'?quiet=False&TaskName=SciScript-Python.Files.createDir'
+    response, content = http("PUT", url)
+    return content
+
+def remove_file_service_path(path_info, recursive=False):
+    path = join_file_service_path(path_info, '')
+    url = f'{SS_FILE_SERVICE_URL}/api/data/{path}' \
+          f'?quiet=False&TaskName=SciScript-Python.Files.delete'
+    response, content = http("DELETE", url)
+    return content
+
+def upload_file_service_file(path_info, local_file_path):
+    auth_token = get_auth_token(ignore_missing=True)
+    headers = {"X-Auth-Token": auth_token}
+    path = join_file_service_path(path_info, '')
+    url = f'{SS_FILE_SERVICE_URL}/api/file/{path}' \
+          f'?quiet=False&TaskName=SciScript-Python.Files.UploadFile'
+    
+    with open(local_file_path, 'rb') as f:
+        response = requests.put(url, data=f, headers=headers, stream=True)
+
+    return handle_http_response(response)
+
+def download_file_service_file(path_info, local_file_path):
+    auth_token = get_auth_token(ignore_missing=True)
+    headers = {"X-Auth-Token": auth_token}
+    path = join_file_service_path(path_info, '')
+    url = f'{SS_FILE_SERVICE_URL}/api/file/{path}?TaskName=SciScript-Python.Files.DownloadFile'
+
+    response = requests.get(url, headers=headers, stream=True)
+    handle_http_response(response, read_content=False)
+
+    if local_file_path == '-':
+        for chunk in response.iter_content(chunk_size=8192):
+            sys.stdout.buffer.write(chunk)
+    else:
+        with open(local_file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+def list_file_service_data_volumes():
+    volumes = get_file_service_volumes()
+
+    file_info_list = []
+
+    for data_volume in volumes["dataVolumes"]:
+        file_info = FileInfo(
+            path = f'ss://{data_volume["name"]}',
+            name = data_volume['name'],
+            owner = '?',
+            group = '?',
+            directory = True,
+            size = 1,
+            date = datetime.now(),
+            read = 'read' in data_volume['allowedActions'],
+            write = 'create' in data_volume['allowedActions'],
+            execute = True
+        )
+        file_info_list.append(file_info)
+
+    return file_info_list
+
+def list_file_service_root_volumes():
+    volumes = get_file_service_volumes()
+
+    file_info_list = []
+    for root_volume in volumes["rootVolumes"]:
+        file_info = FileInfo(
+            path = f'ss://{root_volume["name"]}',
+            name = root_volume['name'],
+            owner = '?',
+            group = '?',
+            directory = True,
+            size = len(root_volume['userVolumes']),
+            date = datetime.now(),
+            read = True,
+            write = 'create' in root_volume['allowedActions'],
+            execute = True
+        )
+        file_info_list.append(file_info)
+
+    return file_info_list
+
+def list_file_service_user_volume_owners(path_info):
+    """
+    Lists the owners of user volumes within a given root volume.
+    """
+
+    volumes = get_file_service_volumes()
+    root_volume = next((v for v in volumes['rootVolumes'] if v['name'] == path_info.root_volume), None)
+    
+    file_info_dict = {}
+    
+    dot = FileInfo(
+        path = f'ss://{path_info.root_volume}',
+        name = '.',
+        owner = '?',
+        group = '?',
+        directory = True,
+        size = len(root_volume['userVolumes']),
+        date = datetime.now(),
+        read = True,
+        write = False,
+        execute = True
+    )
+
+    dotdot = FileInfo(
+        path = 'ss://',
+        name = '..',
+        owner = '?',
+        group = '?',
+        directory = True,
+        size = len(volumes['rootVolumes']),
+        date = datetime.now(),
+        read = True,
+        write = False,
+        execute = True
+    )
+
+    for user_volume in root_volume['userVolumes']:
+        owner = user_volume['owner']
+        if owner not in file_info_dict:
+            file_info_dict[owner] = FileInfo(
+                path = f'ss://{path_info.root_volume}/{owner}',
+                name = owner,
+                owner = f'{owner}',
+                group = '?',
+                directory = True,
+                size = 1,
+                date = datetime.now(),
+                read = 'read' in user_volume['allowedActions'],
+                write = 'write' in user_volume['allowedActions'],
+                execute = True
+            )
+        else:
+            # Increment the size to reflect multiple user volumes for the same owner
+            # Update permissions to reflect the union of permissions across all user volumes for this owner
+            file_info_dict[owner] = file_info_dict[owner]._replace(
+                size=file_info_dict[owner].size + 1,
+                read = file_info_dict[owner].read or ('read' in user_volume['allowedActions']),
+                write = file_info_dict[owner].write or ('write' in user_volume['allowedActions']),
+                execute = True
+            )
+            
+    file_info_list = [dot, dotdot] + list(file_info_dict.values())
+    return file_info_list
+
+def list_file_service_user_volumes(path_info):
+    """
+    Lists the user volumes for a given root volume and owner.
+    """
+
+    volumes = get_file_service_volumes()
+    root_volume = next((v for v in volumes['rootVolumes'] if v['name'] == path_info.root_volume), None)
+
+    dot = FileInfo(
+        path = f'ss://{path_info.root_volume}',
+        name = '.',
+        owner = '?',
+        group = '?',
+        directory = True,
+        size = len([uv for uv in root_volume['userVolumes'] if uv['owner'] == path_info.user_volume_owner]),
+        date = datetime.now(),
+        read = True,
+        write = False,
+        execute = True
+    )
+
+    dotdot = FileInfo(
+        path = 'ss://',
+        name = '..',
+        owner = '?',
+        group = '?',
+        directory = True,
+        size = len(volumes['rootVolumes']),
+        date = datetime.now(),
+        read = True,
+        write = False,
+        execute = True
+    )
+
+    file_info_list = [dot, dotdot]
+
+    for user_volume in root_volume['userVolumes']:
+        if user_volume['owner'] == path_info.user_volume_owner:
+            file_info = FileInfo(
+                path = f'ss://{path_info.root_volume}/{path_info.user_volume_owner}/{user_volume["name"]}',
+                name = user_volume['name'],
+                owner = path_info.user_volume_owner,
+                group = '?',
+                directory = True,
+                size = 1,
+                date = datetime.now(),
+                read = 'read' in user_volume['allowedActions'],
+                write = 'write' in user_volume['allowedActions'],
+                execute = True
+            )
+            file_info_list.append(file_info)
+
+    return file_info_list
+
+def list_file_service_directory(path_info):
+    volumes = get_file_service_volumes()
+    if path_info.root_volume is not None:
+        root_volume = next((v for v in volumes['rootVolumes'] if v['name'] == path_info.root_volume), None)
+        volume = next((uv for uv in root_volume['userVolumes'] if uv['owner'] == path_info.user_volume_owner and uv['name'] == path_info.user_volume), None)
+    elif path_info.data_volume is not None:
+        volume = next((v for v in volumes['dataVolumes'] if v['name'] == path_info.data_volume), None)
+    
+    folder = get_file_service_directory_listing(path_info)
+
+    dot = FileInfo(
+        path = f'ss://{join_file_service_path(path_info, "")}',
+        name = '.',
+        owner = volume['owner'] if 'owner' in volume else '?',
+        group = '?',
+        directory = True,
+        size = len(folder['root']['folders']) + len(folder['root']['files']),
+        date = datetime.now(),
+        read = 'read' in volume['allowedActions'],
+        write = 'write' in volume['allowedActions'],
+        execute = True
+    )
+
+    dotdot = FileInfo(
+        path = f'ss://{join_file_service_path(path_info, "")}',
+        name = '..',
+        owner = '?',
+        group = '?',
+        directory = True,
+        size = 1,
+        date = datetime.now(),
+        read = 'read' in volume['allowedActions'],
+        write = 'write' in volume['allowedActions'],
+        execute = True
+    )
+
+    file_info_list = [dot, dotdot]
+
+    for item in folder['root']['folders']:
+        path = join_file_service_path(path_info, item['name'])
+        file_info = FileInfo(
+            path = f'ss://{path}',
+            name = item['name'],
+            owner = volume['owner'] if 'owner' in volume else '?',
+            group = '?',
+            directory = True,
+            size = 1,
+            date = dateparser.isoparse(item['lastModified']),
+            read = 'read' in volume['allowedActions'],
+            write = 'write' in volume['allowedActions'],
+            execute = True,
+        )
+        file_info_list.append(file_info)
+
+    for item in folder['root']['files']:
+        path = join_file_service_path(path_info, item['name'])
+        file_info = FileInfo(
+            path = f'ss://{path}',
+            name = item['name'],
+            owner = volume['owner'] if 'owner' in volume else '?',
+            group = '?',
+            directory = False,
+            size = item['size'],
+            date = dateparser.isoparse(item['lastModified']),
+            read = 'read' in volume['allowedActions'],
+            write = 'write' in volume['allowedActions'],
+            execute = False,
+        )
+        file_info_list.append(file_info)
+
+    return file_info_list
+
+def is_file_service_path(path):
+    if path is not None and path.startswith('ss://'):
+        return True
+    else:
+        return False
+
+def simplify_file_service_path(path):
+    if path is None:
+        return None
+
+    path = path.strip()
+
+    if path == '':
+        return None
+    
+    if path.startswith('ss://'):
+        # Only keep the first /
+        path = path[4:]
+
+    return path
+
+def split_file_service_path(path):
+    if path is None:
+        return None
+
+    if not path.startswith('/'):
+        raise ValueError("Path must be an absolute path starting with '/'")
+
+    volumes = get_file_service_volumes()
+
+    path = simplify_file_service_path(path)
+    parts = path.split('/')[1:]
+
+    # Figure out if path is a root volume, data volume, or data volume
+    if parts[0] in [v['name'] for v in volumes['rootVolumes']]: 
+        path_info = FileServicePathInfo(
+            data_volume = None,
+            root_volume = parts[0],
+            user_volume_owner = parts[1] if len(parts) > 1 else None,
+            user_volume = parts[2] if len(parts) > 2 else None,
+            relative_path = "/".join(parts[3:]) if len(parts) > 3 else ''
+        )
+        return path_info
+    elif parts[0] in [v['name'] for v in volumes['dataVolumes']]:
+        path_info = FileServicePathInfo(
+            data_volume = parts[0],
+            root_volume = None,
+            user_volume_owner = None,
+            user_volume = None,
+            relative_path = "/".join(parts[1:]) if len(parts) > 1 else ''
+        )
+        return path_info
+    else:
+        raise ValueError(f"Path must start with a valid root or data volume.")
+
+def join_file_service_path(path_info, name):
+    if path_info.data_volume is not None:
+        path = os.path.join(
+            path_info.data_volume,
+            path_info.relative_path,
+            name
+        )
+    elif path_info.root_volume is not None:
+        path = os.path.join(
+            path_info.root_volume,
+            path_info.user_volume_owner,
+            path_info.user_volume,
+            path_info.relative_path,
+            name
+        )
+    else:
+        raise ValueError("Invalid path info. Must specify either data volume or root volume with user volume owner and user volume.")
+    
+    return path
+
+def print_file_info_list(file_info_list):
+    # Print file info in the style of 'ls -la'
+
+    size_max_width = max(len(str(file_info.size)) for file_info in file_info_list) if file_info_list else 0
+    owner_max_width = max(len(file_info.owner) for file_info in file_info_list) if file_info_list else 0
+
+    for file_info in file_info_list:
+        permissions = (
+            ('d' if file_info.directory else '-') +
+            ('r' if file_info.read else '-') +
+            ('w' if file_info.write else '-') +
+            ('x' if file_info.execute else '-')
+        )
+        print(f"{permissions} {file_info.size:>{size_max_width}} {file_info.owner:<{owner_max_width}} {file_info.date:%Y-%m-%d %H:%M} {file_info.name}")
+
+def parser_login(subparsers):
+    login_parser = subparsers.add_parser('login', help='Authenticate with SciServer and print the authentication token.')
+    login_parser.add_argument('--username', '-u', help='SciServer username (can also be set with SS_USERNAME environment variable)')
+    login_parser.add_argument('--password', '-p', help='SciServer password (can also be set with SS_PASSWORD environment variable)')
+    login_parser.add_argument('-s', action='store_true', help='Return a shell command to set the SS_TOKEN environment. Run with eval $(sciserver login -s) to set the token in your shell environment.')
+
+def command_login(args):
+    try:
+        token = auth(username=args.username, password=args.password)
+        if args.s:
+            print(f'export SS_TOKEN="{token}"')
+        else:
+            print(token)
+    except HttpError as e:
+        print(f"Authentication failed: {e.message} (HTTP {e.status_code})", file=sys.stderr)
+        sys.exit(1)
+
+def parser_ls(subparsers):
+    ls_parser = subparsers.add_parser('ls', help='List files in a SciServer directory')
+    ls_parser.add_argument('path', nargs='?', help='Path to list')
+
+def command_ls(args):
+    path = simplify_file_service_path(args.path)
+    if path is None or path == '/':
+        # Listing the root volumes
+        root_volume_file_info_list = list_file_service_root_volumes()
+        data_volume_file_info_list = list_file_service_data_volumes()
+        dot = FileInfo(
+            path = 'ss://',
+            name = '.',
+            owner = '?',
+            group = '?',
+            directory = True,
+            size = len(root_volume_file_info_list) + len(data_volume_file_info_list),
+            date = datetime.now(),
+            read = True,
+            write = False,
+            execute = True
+        )
+        print_file_info_list([dot] + root_volume_file_info_list + data_volume_file_info_list)
+    elif path.startswith('/'):
+        # Listing an absolute pat
+        path_info = split_file_service_path(path)
+        if path_info.data_volume is not None:
+            raise NotImplementedError("Listing data volumes is not implemented yet.")
+        elif path_info.root_volume is not None:
+            if path_info.user_volume_owner is None or path_info.user_volume_owner == '':
+                # Listing user volume owners in a root volume
+                file_info_list = list_file_service_user_volume_owners(path_info)
+            elif path_info.user_volume is None or path_info.user_volume == '':
+                # Listing user volumes for a user in a root volume
+                file_info_list = list_file_service_user_volumes(path_info)
+            else:
+                # Listing files in a user volume
+                file_info_list = list_file_service_directory(path_info)
+        else:
+            raise NotImplementedError()
+
+        print_file_info_list(file_info_list)
+    else:
+        print("Invalid path. Path must be an absolute path starting with '/'.", file=sys.stderr)
+        sys.exit(1)
+
+    pass
+
+def parser_mkdir(subparsers):
+    mkdir_parser = subparsers.add_parser('mkdir', help='Create a directory in SciServer.')
+    mkdir_parser.add_argument('path', help='Path of the directory to create')
+
+def command_mkdir(args):
+    path = simplify_file_service_path(args.path)
+    path_info = split_file_service_path(path)
+    make_file_service_directory(path_info)
+
+def parser_rm(subparsers):
+    rm_parser = subparsers.add_parser('rm', help='Remove a file or directory from SciServer.')
+    rm_parser.add_argument('path', help='Path of the file to remove')
+
+def command_rm(args):
+    path = simplify_file_service_path(args.path)
+    path_info = split_file_service_path(path)
+    remove_file_service_path(path_info)
+
+def parser_cp(subparsers):
+    cp_parser = subparsers.add_parser('cp', help='Copy a file in SciServer.')
+    cp_parser.add_argument('source', help='Path of the source file')
+    cp_parser.add_argument('destination', help='Path of the destination file')
+    cp_parser.add_argument('-r', '--recursive', action='store_true', help='Recursively copy directories')
+
+def command_cp(args):
+    if not is_file_service_path(args.source) and is_file_service_path(args.destination):
+        # Upload
+        path = simplify_file_service_path(args.destination)
+        path_info = split_file_service_path(path)
+        upload_file_service_file(path_info, args.source)
+    elif is_file_service_path(args.source) and not is_file_service_path(args.destination):
+        # Download
+        path = simplify_file_service_path(args.source)
+        path_info = split_file_service_path(path)
+        download_file_service_file(path_info, args.destination)
+    else:
+        raise NotImplementedError()
+
+def parser_mv(subparsers):
+    mv_parser = subparsers.add_parser('mv', help='Move a file in SciServer.')
+    mv_parser.add_argument('source', help='Path of the source file')
+    mv_parser.add_argument('destination', help='Path of the destination file')
+
+def command_mv(args):
+    pass
+
+def parser_cat(subparsers):
+    cat_parser = subparsers.add_parser('cat', help='Print the contents of a file in SciServer.')
+    cat_parser.add_argument('path', help='Path of the file to print')
+
+def command_cat(args):
+    path = simplify_file_service_path(args.path)
+    path_info = split_file_service_path(path)
+    download_file_service_file(path_info, '-')
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='SciServer command-line tool.')
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    parser_login(subparsers)
+    parser_ls(subparsers)
+    parser_mkdir(subparsers)
+    parser_rm(subparsers)
+    parser_cp(subparsers)
+    parser_mv(subparsers)
+    parser_cat(subparsers)
+    
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+
+    if args.command == 'login':
+        command_login(args)
+    elif args.command == 'ls':
+        command_ls(args)
+    elif args.command == 'mkdir':
+        command_mkdir(args)
+    elif args.command == 'rm':
+        command_rm(args)
+    elif args.command == 'cp':
+        command_cp(args)
+    elif args.command == 'mv':
+        command_mv(args)
+    elif args.command == 'cat':
+        command_cat(args)
+    else:
+        print("No command specified. Use --help for available commands.", file=sys.stderr)
+        sys.exit(1)
+
+main()
