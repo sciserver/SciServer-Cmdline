@@ -158,33 +158,58 @@ def get_file_service_directory_listing(path_info):
     response, folder = http("GET", url)
     return folder
 
-def make_file_service_directory(path_info):
+def make_file_service_directory(path_info, verbose=False):
     path = join_file_service_path(path_info, '')
     url = f'{SS_FILE_SERVICE_URL}/api/folder/{path}' \
           f'?quiet=False&TaskName=SciScript-Python.Files.createDir'
     response, content = http("PUT", url)
+    if verbose:
+        print(f"'{path}'")
     return content
 
-def remove_file_service_path(path_info, recursive=False):
+def remove_file_service_path(path_info, recursive=False, verbose=False):
     path = join_file_service_path(path_info, '')
     url = f'{SS_FILE_SERVICE_URL}/api/data/{path}' \
           f'?quiet=False&TaskName=SciScript-Python.Files.delete'
     response, content = http("DELETE", url)
+    if verbose:
+        print(f"'{path}'")
     return content
 
-def upload_file_service_file(path_info, local_file_path):
+def upload_file_service_file(path_info, local_file_path, verbose=False, progress=False):
     auth_token = get_auth_token(ignore_missing=True)
     headers = {"X-Auth-Token": auth_token}
     path = join_file_service_path(path_info, '')
     url = f'{SS_FILE_SERVICE_URL}/api/file/{path}' \
           f'?quiet=False&TaskName=SciScript-Python.Files.UploadFile'
-    
-    with open(local_file_path, 'rb') as f:
-        response = requests.put(url, data=f, headers=headers, stream=True)
+
+    if progress:
+        def read_with_progress(path, chunk_size=8192):
+            total = os.path.getsize(path)
+            done = 0
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    done += len(chunk)
+                    msg = f'[ {done:>10d}/{total:>10d} bytes ]\r'
+                    print(msg, end='', flush=True)
+                    yield chunk
+
+        response = requests.put(url, data=read_with_progress(local_file_path), headers=headers, stream=True)
+    else:
+        with open(local_file_path, 'rb') as f:
+            response = requests.put(url, data=f, headers=headers, stream=True)
+
+    if verbose:
+        print(f"'{local_file_path}' -> '{path}'")
+    elif progress:
+        print()  # Print newline after progress
 
     return handle_http_response(response)
 
-def download_file_service_file(path_info, local_file_path):
+def download_file_service_file(path_info, local_file_path, verbose=False, progress=False):
     auth_token = get_auth_token(ignore_missing=True)
     headers = {"X-Auth-Token": auth_token}
     path = join_file_service_path(path_info, '')
@@ -193,13 +218,34 @@ def download_file_service_file(path_info, local_file_path):
     response = requests.get(url, headers=headers, stream=True)
     handle_http_response(response, read_content=False)
 
+    total = int(response.headers.get("Content-Length", None))
+
     if local_file_path == '-':
+        # Works similar to 'cat' - print file contents to stdout
         for chunk in response.iter_content(chunk_size=8192):
             sys.stdout.buffer.write(chunk)
+
+        # We do not print anything when in 'cat' mode
     else:
+        # Works similar to 'cp' - download file to local path
         with open(local_file_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+
+                # Print progress
+                if progress:
+                    done = f.tell()
+                    if total is not None:
+                        msg = f'[ {done:>10d}/{total:>10d} bytes ]\r'
+                    else:
+                        msg = f'[ {done:>10d}/?????????? bytes ]\r'
+                    
+                    print(msg, end='', flush=True)
+
+        if verbose:
+            print(f"'{path}' -> '{local_file_path}'")
+        elif progress:
+            print()  # Print newline after progress
 
 def list_file_service_data_volumes():
     volumes = get_file_service_volumes()
@@ -592,38 +638,43 @@ def command_ls(args):
 def parser_mkdir(subparsers):
     mkdir_parser = subparsers.add_parser('mkdir', help='Create a directory in SciServer.')
     mkdir_parser.add_argument('path', help='Path of the directory to create')
+    mkdir_parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
 
 def command_mkdir(args):
     path = simplify_file_service_path(args.path)
     path_info = split_file_service_path(path)
-    make_file_service_directory(path_info)
+    make_file_service_directory(path_info, verbose=args.verbose)
 
 def parser_rm(subparsers):
     rm_parser = subparsers.add_parser('rm', help='Remove a file or directory from SciServer.')
     rm_parser.add_argument('path', help='Path of the file to remove')
+    rm_parser.add_argument('-r', '--recursive', action='store_true', help='Recursively remove directories')
+    rm_parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
 
 def command_rm(args):
     path = simplify_file_service_path(args.path)
     path_info = split_file_service_path(path)
-    remove_file_service_path(path_info)
+    remove_file_service_path(path_info, recursive=args.recursive, verbose=args.verbose)
 
 def parser_cp(subparsers):
     cp_parser = subparsers.add_parser('cp', help='Copy a file in SciServer.')
     cp_parser.add_argument('source', help='Path of the source file')
     cp_parser.add_argument('destination', help='Path of the destination file')
     cp_parser.add_argument('-r', '--recursive', action='store_true', help='Recursively copy directories')
+    cp_parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
+    cp_parser.add_argument('--progress', action='store_true', help='Show progress during file upload/download')
 
 def command_cp(args):
     if not is_file_service_path(args.source) and is_file_service_path(args.destination):
         # Upload
         path = simplify_file_service_path(args.destination)
         path_info = split_file_service_path(path)
-        upload_file_service_file(path_info, args.source)
+        upload_file_service_file(path_info, args.source, verbose=args.verbose, progress=args.progress)
     elif is_file_service_path(args.source) and not is_file_service_path(args.destination):
         # Download
         path = simplify_file_service_path(args.source)
         path_info = split_file_service_path(path)
-        download_file_service_file(path_info, args.destination)
+        download_file_service_file(path_info, args.destination, verbose=args.verbose, progress=args.progress)
     else:
         raise NotImplementedError()
 
@@ -631,6 +682,8 @@ def parser_mv(subparsers):
     mv_parser = subparsers.add_parser('mv', help='Move a file in SciServer.')
     mv_parser.add_argument('source', help='Path of the source file')
     mv_parser.add_argument('destination', help='Path of the destination file')
+    mv_parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
+    mv_parser.add_argument('--progress', action='store_true', help='Show progress during file upload/download')
 
 def command_mv(args):
     pass
